@@ -1,0 +1,30 @@
+[package]
+name = "x-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes = "0.9.4"
+bytes = "1.12.1"
+ctrlc = "3.5.2"
+futures-core = "0.3.34"
+futures-util = "0.3.34"
+msixvc = { git = "https://github.com/xodus-gaming/xodus", version = "0.1.0" }
+msixvc-common = { git = "https://github.com/xodus-gaming/xodus", version = "0.1.0" }
+nix = "0.31.3"
+reqwest = "0.13.5"
+rustix = "1.1.6"
+serde = "1.0.229"
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tempfile = "3.27.0"
+tokio = "1.54.1"
+uuid = "1.29.1"
+xodus = { git = "https://github.com/xodus-gaming/xodus", version = "0.1.0", features = ["key-chain-file"] }
+zerocopy = "0.8.63"
+
+[lib]
+crate-type = ["dylib"] 
+
+[patch.crates-io]
+ntfs = { git = "https://github.com/xodus-gaming/ntfs.git" }
