@@ -47,8 +47,15 @@ pub async fn get_license(
     .expect("Failed to get ms user token");
 
     let ms_device_token: Token = ms_device_token.into();
-    let Token::Compact(ms_device_token) = ms_device_token else {
-        return Err("Unsupported token 2".to_string());
+    let ms_device_token = match ms_device_token {
+        Token::Compact(t) => {
+            if let Some(s) = t.strip_prefix("d=") {
+                s.to_owned()
+            } else {
+                t
+            }
+        },
+        _ => unreachable!(),
     };
 
     let user_token: Token = match user_token {
