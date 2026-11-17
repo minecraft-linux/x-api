@@ -23,7 +23,7 @@ use xodus::{
         soap,
     },
     secrets,
-    tokens::TokenManager,
+    tokens::{TokenManager, device::ensure_device_credentials},
     xal::{
         self, DeviceType, XalAppParameters, XalAuthenticator,
         oauth2::{AccessToken, EmptyExtraTokenFields},
@@ -276,6 +276,32 @@ pub extern "system" fn device_import(serialized: *const c_char) -> *const Device
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn device_create(
+    runtime: *const Runtime,
+    context: u64,
+    success: unsafe extern "system" fn(u64, *const Device),
+    _failure: unsafe extern "system" fn(u64, error: *const c_char),
+) {
+    let runtime = unsafe { &*runtime };
+    secrets::init_secrets().expect("Unable to initialize credentials");
+    runtime.tokio.spawn(async move {
+        let def_store = TokenManager::with_memory();
+        ensure_device_credentials(&runtime.client, &def_store).await;
+        unsafe {
+            success(
+                context,
+                Device::from(&def_store).map_or_default(|d| Arc::into_raw(Arc::new(d))),
+            )
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn device_release(user: *const Device) {
+    drop(unsafe { Arc::from_raw(user) });
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn get_user_key_chain() -> *const User {
     secrets::init_secrets().expect("Unable to initialize credentials");
     let def_store = TokenManager::with_keychain_and_memory();
@@ -297,6 +323,11 @@ pub extern "system" fn user_import(serialized: *const c_char) -> *const User {
     let user =
         serde_json::from_str(&unsafe { CStr::from_ptr(serialized) }.to_string_lossy()).unwrap();
     Arc::into_raw(Arc::new(user))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn user_release(user: *const User) {
+    drop(unsafe { Arc::from_raw(user) });
 }
 
 const CLIENT_ID: &str = "0000000040159362";
