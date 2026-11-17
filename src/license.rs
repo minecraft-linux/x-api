@@ -54,7 +54,7 @@ pub async fn get_license(
             } else {
                 t
             }
-        },
+        }
         _ => unreachable!(),
     };
 
@@ -80,7 +80,7 @@ pub async fn get_license(
             } else {
                 t
             }
-        },
+        }
         _ => unreachable!(),
     };
 
@@ -97,7 +97,6 @@ pub async fn get_license(
 
     println!("content req {:?}", content);
     println!("game_license req {:?}", game_license);
-    
 
     let game_splicense = SPLicense::parse_base64(&game_license.splicense_block)
         .expect("could not parse base64 game SPLicense");
