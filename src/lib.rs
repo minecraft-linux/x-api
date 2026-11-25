@@ -670,16 +670,17 @@ async fn prepare(_lfiles: &HashMap<String, SegmentFile>) -> (impl AsyncFnOnce(),
 
 #[derive(Deserialize, Debug)]
 pub struct Executable {
-    #[serde(rename = "Name")]
+    #[serde(rename = "@Name")]
     pub name: String,
-    #[serde(rename = "TargetDeviceFamily")]
-    pub target_device_family: String,
-    #[serde(rename = "Id")]
+    // #[serde(rename = "@TargetDeviceFamily")]
+    // pub target_device_family: String,
+    #[serde(rename = "@Id")]
     pub id: String,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct ExecutableList {
+    #[serde(rename = "Executable", default)]
     pub executables: Vec<Executable>,
 }
 
@@ -917,7 +918,6 @@ pub extern "system" fn run_game(
         );
     }
     if !xuser.is_null() {
-        unsafe { &*xuser }.fill(&tokens).unwrap();
         env.insert(
             "XODUS_X_USER",
             serde_json::to_string(unsafe { &*xuser }).unwrap(),
@@ -942,6 +942,18 @@ pub async fn run(
     market: Option<String>,
     env: HashMap<&str, String>,
 ) -> ExitCode {
+    let exe = if let Ok(mut fs) = tokio::fs::File::open(Path::new(&source).join("MicrosoftGame.config")).await {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = String::new();
+        fs.read_to_string(&mut bytes).await.unwrap();
+
+        let config: Game = quick_xml::de::from_str(&bytes).unwrap();
+        
+        Some(config.executable_list.executables.first().unwrap().name.clone())
+    } else {
+        exe
+    };
+
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
     let out: &Path = Path::new(&source);
