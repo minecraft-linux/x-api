@@ -9,9 +9,11 @@ bytes = "1.12.1"
 ctrlc = "3.5.2"
 futures-core = "0.3.34"
 futures-util = "0.3.34"
+gpt = "4.1.0"
 msixvc = { git = "https://github.com/xodus-gaming/xodus", version = "0.1.0" }
 msixvc-common = { git = "https://github.com/xodus-gaming/xodus", version = "0.1.0" }
 nix = "0.31.3"
+quick-xml = "0.42.0"
 reqwest = "0.13.5"
 rustix = "1.1.6"
 serde = "1.0.229"

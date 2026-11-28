@@ -1,7 +1,11 @@
 use std::cmp::max;
 use std::cmp::min;
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Debug;
 use std::fs::File;
+use std::io;
+use std::io::Error;
+use std::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, Div};
 use std::path::PathBuf;
@@ -13,6 +17,8 @@ use aes::cipher::KeyInit;
 use aes::{Aes128Dec, Aes128Enc};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
+use msixvc::streaming_ntfs::collect_ntfs_stream_layouts;
+use msixvc::xvd::SyncSubstream;
 use msixvc_common::parse::{BinaryParse, BinaryTryParse};
 use reqwest::Client;
 use reqwest::header::RANGE;
@@ -267,6 +273,7 @@ struct RangeProgress {
 
 struct RangeProgressManager {
     registry: std::sync::Mutex<Vec<Arc<RangeProgress>>>,
+    ntfs_files: std::sync::Mutex<Arc<Vec<(String, u64, u64, u64, bool)>>>,
 }
 
 pub struct Package {
@@ -274,7 +281,7 @@ pub struct Package {
     pub hashes: Arc<Vec<u8>>,
     pub package_full_name: String,
     pub xvc_info: XvcInfo,
-    pub sfiles: Vec<(String, u64, u64, u64, bool)>,
+    pub sfiles: Arc<Vec<(String, u64, u64, u64, bool)>>,
     pub region_headers: Vec<XvcRegionHeader>,
     pub region_specs: Vec<XvcRegionSpecifier>,
     pub region_flags: Vec<u32>,
@@ -440,37 +447,30 @@ impl Package {
         };
 
         let d2 = destination.clone();
-        let ft = tokio::task::spawn_blocking(move || {
-            let byte_len = 1 * 4 * 1024;
-            let mut buf = bytes::BytesMut::with_capacity(byte_len);
-            buf.resize(byte_len, 0);
-            let (out_io, in_prov_valid) = mpsc::channel::<Bytes>(10);
-            rclone.new(out_io, start.to_bytes().0 as usize, /*(end.to_bytes().0 - 1) as usize*/0);
-            let mut reader = ChannelReader {
-                in_prov_valid: in_prov_valid,
-                remaining_b: None,
-            };
-            let mut fout =  {
-                let file_name = PathBuf::from(d2)
-                    .join(".xodus-streaming.msixvc");
-                std::fs::create_dir_all(file_name.parent().to_result("no parent").unwrap()).unwrap();
-                File::create(file_name).unwrap()
-            };
-            let mut written = 0;
-            while written < end.0 {
-                println!("residuent {} / {}", written, end.0);
-                let bytes_to_copy = min(buf.len(), ((end.0 - written) * 4096) as usize);
-                reader.read_full(&mut buf[..bytes_to_copy]).unwrap();
-                prog.cur.fetch_add(bytes_to_copy, Ordering::SeqCst);
-                fout.write_all(&buf[..bytes_to_copy]).unwrap();
-                written += (bytes_to_copy / 4096) as u32;
-            }
-            fout.sync_all().unwrap();
+        let layout = self.xvd_header.layout();
+        let needs_fetch = self.sfiles.is_empty();
+        let ft: JoinHandle<std::prelude::v1::Result<Vec<(String, u64, u64, u64, bool)>, Box<dyn std::error::Error + Send>>> = tokio::task::spawn_blocking(move || {
+            fetch_residual_data(start, end, rclone, prog, d2, layout, needs_fetch)
         });
+
+        let mut ft = Some(ft);
+
+        if needs_fetch {
+            let result = ft.take().unwrap().await?.unwrap();
+            // *Arc::get_mut(&mut self.sfiles).unwrap() = result;
+            let mut ntfs_files = self
+                .progress
+                .ntfs_files
+                .lock()
+                .map_err(|_| std::io::Error::other("ntfs_files"))?;
+            *Arc::get_mut(&mut ntfs_files).unwrap() = result;
+        }
 
         self.download_ext(reader, Some(destination), full_key, vec![], None)
             .await?;
-        ft.await?;
+        if let Some(ft) = ft.take() {
+            _ = ft.await?;
+        }
         Ok(())
         // let mut handles = Vec::new();
         // for (region, l) in &self.build_file_map() {
@@ -492,7 +492,18 @@ impl Package {
         let mut region_offset = region_headers[0].offset;
         let mut file_map = Vec::new();
         let mut region_list = &mut file_map.push_mut((region_headers[0].clone(), Vec::new())).1;
-        for (i, (entry, bs, _, ps, e)) in (&self.sfiles).iter().enumerate() {
+        let mut st : Option<Arc<_>> = None;
+        let csfiles = if self.sfiles.is_empty() {
+            let ntfs_files = self
+                    .progress
+                    .ntfs_files
+                    .lock().unwrap();
+            st = Some(ntfs_files.clone());
+            &st.as_ref().unwrap()
+        } else {
+            &self.sfiles
+        };
+        for (i, (entry, bs, _, ps, e)) in csfiles.iter().enumerate() {
             while region_headers.len() > 1 && region_headers[1].first_segment_index as usize <= i {
                 region_headers = &region_headers[1..];
                 region_offset = region_headers[0].offset;
@@ -504,6 +515,7 @@ impl Package {
             region_list.push((entry.to_string(), o, ps, bs, *e));
             region_offset += Pages(ps as u32);
         }
+        drop(st);
         file_map
     }
 
@@ -598,9 +610,9 @@ impl Package {
     where
         ReaderFactory: RangeReaderFactory + Send + 'static,
     {
-        if self.sfiles.is_empty() {
-            Err(std::io::Error::other("legacy file requires NTFS"))?;
-        }
+        // if self.sfiles.is_empty() {
+        //     Err(std::io::Error::other("legacy file requires NTFS"))?;
+        // }
         let hashes = self.hashes.clone();
         let layout = self.xvd_header.layout();
         let header = self.xvd_header.clone();
@@ -757,6 +769,118 @@ impl Package {
 
         Ok(())
     }
+}
+
+fn fetch_residual_data<ReaderFactory>(start: Pages, end: Pages, rclone: ReaderFactory, prog: Arc<RangeProgress>, d2: String, layout: XvdLayout, needs_fetch: bool) -> std::prelude::v1::Result<Vec<(String, u64, u64, u64, bool)>, Box<dyn std::error::Error + Send>> where ReaderFactory: RangeReaderFactory + Send + 'static + Clone {
+    let byte_len = 1 * 4 * 1024;
+    let mut buf = bytes::BytesMut::with_capacity(byte_len);
+    buf.resize(byte_len, 0);
+    let (out_io, in_prov_valid) = mpsc::channel::<Bytes>(10);
+    rclone.new(out_io, start.to_bytes().0 as usize, /*(end.to_bytes().0 - 1) as usize*/0);
+    let mut reader = ChannelReader {
+        in_prov_valid: in_prov_valid,
+        remaining_b: None,
+    };
+    let mut fout =  {
+        let file_name = PathBuf::from(&d2)
+            .join(".xodus-streaming.msixvc");
+        std::fs::create_dir_all(file_name.parent().to_result("no parent").unwrap()).unwrap();
+        File::create(file_name).unwrap()
+    };
+    let mut written = 0;
+    while written < end.0 {
+        // println!("residuent {} / {}", written, end.0);
+        let bytes_to_copy = min(buf.len(), ((end.0 - written) * 4096) as usize);
+        reader.read_full(&mut buf[..bytes_to_copy]).unwrap();
+        prog.cur.fetch_add(bytes_to_copy, Ordering::SeqCst);
+        fout.write_all(&buf[..bytes_to_copy]).unwrap();
+        written += (bytes_to_copy / 4096) as u32;
+    }
+    fout.sync_all().unwrap();
+
+    if !needs_fetch {
+        return Ok(Vec::new());
+    }
+    drop(fout);
+
+    let file_name = PathBuf::from(&d2)
+        .join(".xodus-streaming.msixvc");
+
+    let fin = File::open(file_name).unwrap();
+
+    let drive_data_offset = layout.drive_data.start.to_bytes().0;
+    let drive_plain_len = written as u64 *4096 - drive_data_offset;
+
+    let block_size = 4096;
+    let drive = SyncSubstream::new(
+        fin,
+        drive_data_offset,
+        drive_plain_len,
+    );
+
+    let gp = gpt::GptConfig::new()
+        .writable(false)
+        .logical_block_size(if block_size == 512 {
+            gpt::disk::LogicalBlockSize::Lb512
+        } else if block_size == 4096 {
+            gpt::disk::LogicalBlockSize::Lb4096
+        } else {
+            todo!("unsupported block_size: {}", block_size)
+        })
+        .open_from_device(drive).unwrap();
+
+    let (_, part) = gp
+        .partitions()
+        .iter()
+        .find(|(_, part)| part.is_used())
+        .ok_or_else(|| {
+            io::Error::new(ErrorKind::NotFound, "no used GPT partition found")
+        }).unwrap();
+
+    let part_start = part.bytes_start(*gp.logical_block_size()).unwrap();
+
+    let bridge = gp.take_device().into_inner();
+    let partition_offset = drive_data_offset + part_start;
+    let partition_plain_len = written as u64 *4096 - partition_offset;
+
+    let mut fs = SyncSubstream::new(
+        bridge,
+        partition_offset,
+        partition_plain_len,
+    );
+
+    let reports = collect_ntfs_stream_layouts(&mut fs).unwrap();
+    let mut files = Vec::<(String, u64, u64, u64, bool)>::new();
+
+    for report in reports {
+        if report.path.starts_with('$') || report.path.contains(':') {
+            continue;
+        }
+        if report.resident_data || report.data_runs.len() != 1 {
+            continue;
+        }
+
+        let Some(data_run) = report.data_runs.first() else {
+            continue;
+        };
+        let Some(start) = data_run.start else {
+            continue;
+        };
+
+        files.push(
+            (
+                report.path.replace("/", "\\"),
+                report.value_length,
+                (partition_offset + start) / 4096,
+                report.value_length.div_ceil(4096),
+                report.path.to_ascii_lowercase().ends_with(".exe"),
+            ),
+        );
+    }
+
+    files.sort_by_key(|(_, _, start, _, _)| *start);
+
+    Ok(files)
 }
 
 pub async fn stream_fast<ReaderFactory>(reader: ReaderFactory) -> Result<Package>
@@ -977,7 +1101,7 @@ where
                 xvd_header,
                 hashes: l1_hashs,
                 package_full_name,
-                sfiles,
+                sfiles: Arc::new(sfiles),
                 xvc_info,
                 region_headers,
                 region_specs,
@@ -985,6 +1109,7 @@ where
                 package_files,
                 progress: Arc::new(RangeProgressManager {
                     registry: std::sync::Mutex::new(Vec::new()),
+                    ntfs_files: std::sync::Mutex::new(Arc::new(Vec::new()))
                 }),
             })
         })()
